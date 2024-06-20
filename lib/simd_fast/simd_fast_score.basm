@@ -1,0 +1,68 @@
+    .section .rodata
+.l_1:
+    .word 1
+.l_h80:
+    .word 0x80
+
+    .section .text
+    .align 4
+    .literal .lp_1, .l_1
+    .literal .lp_h80, .l_h80
+
+    .global simd_fast_score
+    .type   simd_fast_score,@function
+# compute the score of a pixel ring using SAD
+# int32_t simd_fast_score(const simd_u8x16 ring, uint32_t center)
+simd_fast_score:
+    entry           sp, 48            # prepare windowed registers and reserve 16 bytes of stack
+
+    #define rp_ring a2
+    #define r_center a3
+
+    #define v_ring q[0-7]
+    ld.qr           v_ring, rp_ring, 0              # ring = ring[0:16]
+
+    #define rp_h80 a[3-11]
+    l32r            rp_h80, .lp_h80                 # p_h80 = .p_h80
+    #define v_h80 q[0-7]
+    ee.vldbc.8      v_h80, rp_h80                   # h80 = [ 0x80, ] * 16
+    #undef rp_h80
+    ee.xorq         v_ring, v_ring, v_h80           # pixels ^= [ 0x80, ] * 16 ; essentially "shifts down" the range from [0-255] (unsigned) to [-128, 127] (signed)
+
+    s8i             r_center, sp, 0                 # store center on stack
+    #define v_center q[0-7]
+    ee.vldbc.8      v_center, sp                    # center = [ center, ] * 16
+    #undef r_center
+    ee.xorq         v_center, v_center, v_h80       # v_center ^= [ 0x80, ] * 16
+    #undef v_h80
+
+    #define v_delta q[0-7]
+    ee.vsubs.s8     v_delta, v_ring, v_center       # delta = ring - center
+    st.qr           v_delta, rp_ring, 0
+    #undef v_ring
+    #undef v_center
+
+    #define r_0 a[3-11]
+    #define r_neg_1 a[3-11]
+    movi.n          r_0, 0
+    movi.n          r_neg_1, -1
+
+    ee.vrelu.s8     v_delta, r_neg_1, r_0           # delta = abs(delta)
+    #undef r_neg_1
+
+    ee.zero.accx                                    # ACCX = 0
+
+    #define rp_1 a[3-11]
+    l32r            rp_1, .lp_1                     # p_1 = .p_1
+    #define v_1 q[0-7]
+    ee.vldbc.8      v_1, rp_1                       # 1 = [ 1, ] * 16
+    #undef rp_1
+
+    ee.vmulas.s8.accx   v_delta, v_1                # ACCX = dot(abs(delta), 1)
+
+    #undef v_delta
+
+    ee.srs.accx     a2, r_0, 0                      # retval = ACCX >> 0
+    #undef r_0
+return:
+    retw                        # restore state (windowed registers) and return to caller

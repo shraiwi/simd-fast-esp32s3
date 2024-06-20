@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "*.basm": "platformio-debug.asm",
+        "compare": "c",
+        "fast.h": "c",
+        "simd_fast.h": "c",
+        "simd_types.h": "c",
+        "stdbool.h": "c"
+    }
+}

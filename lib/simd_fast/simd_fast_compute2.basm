@@ -1,0 +1,121 @@
+    .section .text
+
+    .global simd_fast_compute2
+    .type   simd_fast_compute2,@function
+# compute the score and whether or not a group of 16 rings satisfies the criteria.
+# uint32_t simd_fast_compute2(const simd_u8x16 centers, const simd_u8x16 rings[16], uint32_t b, simd_u8x16 scores)
+simd_fast_compute2:
+    entry           a1, 16            # prepare windowed registers and reserve 16 bytes of stack
+
+    #define rp_centers a2
+    #define rp_rings a3
+    #define r_b a4
+    #define rp_scores a5
+
+    #define v_b q0
+    #define rp_stack_head a15
+    mov.n           rp_stack_head, sp
+    addi            r_b, r_b, 1             # r_b += 1 
+    s32i.n          r_b, rp_stack_head, 0   # store r_b + 1 on the stack.
+    ee.vldbc.8      v_b, rp_stack_head      # v_b = [b + 1, ] * 16
+
+    #define v_centers q1
+    ld.qr           v_centers, rp_centers, 0    # v_centers = rp_centers[0:16]
+
+    #define v_max_count q2
+    #define v_curr_count q3
+    #define v_delta q4
+    #define v_prev_delta q5
+
+    ee.zero.q       v_max_count
+    ee.zero.q       v_curr_count
+    ee.zero.qacc                                        # QACC = [0, ] * 16
+
+    ee.vld.128.ip   v_delta, rp_rings, 16               # delta = rings[0:16]; rings += 16
+    ee.vsubs.s8     v_delta, v_delta, v_centers         # delta = delta - centers
+    mv.qr           v_prev_delta, v_delta               # prev_delta = delta
+
+    #define r_1 a14
+    movi.n          r_1, 1
+    s32i.n          r_1, rp_stack_head, 0               # store 1 on the stack.
+    #undef r_1
+
+    #define r_0 a14
+    #define r_neg_1 a13
+    movi.n          r_0, 0
+    movi            r_neg_1, -1
+
+
+    #define r_16 a12
+    movi            r_16, 15
+
+    # load delta
+
+loopnez r_16, loop_end
+    #undef r_16
+
+loop_start:
+    #define v_signne q6
+    ee.xorq         v_signne, v_delta, v_prev_delta     # signne = (+) where sign(delta) == sign(prev_delta) else (-)
+    #define v_0 q7
+    ee.zero.q       v_0
+    ee.vmin.s8      v_signne, v_signne, v_0             # signne = 0 where sign(delta) == sign(prev_delta) else (-)
+    #undef v_0 // q7
+    mv.qr           v_prev_delta, v_delta               # prev_delta = delta
+    ee.vrelu.s8     v_delta, r_neg_1, r_0               # delta = abs(delta)
+    #define v_1 q7
+    ee.vldbc.8      v_1, rp_stack_head                  # v_1 = [1, ] * 16
+    ee.vmulas.s8.qacc   v_delta, v_1                    # QACC += abs(delta) * [1, ]
+    #undef v_1 // q7
+    #define v_inc q7
+    ee.vcmp.gt.s8   v_inc, v_delta, v_b                 # inc = -1 where abs(delta) > b else 0
+    # inc = 1 where sign(delta) == sign(prev_delta) and abs(delta) > b else (- or 0)
+    ee.vsubs.s8     v_inc, v_signne, v_inc              # inc = signne - inc
+    #undef v_signne // q6
+    #define v_0 q6
+    ee.zero.q v_0
+    ee.vcmp.gt.s8   v_inc, v_inc, v_0                   # inc = -1 where inc > 0 else 0
+    #undef v_0 // q6
+
+    ee.vsubs.s8     v_curr_count, v_curr_count, v_inc   # curr_count -= inc
+    ee.andq         v_curr_count, v_curr_count, v_inc   # curr_count &= v_inc
+    ee.vmax.s8      v_max_count, v_max_count, v_curr_count  # v_max_count = max(v_max_count, v_curr_count)
+    #undef v_inc
+
+    ee.vld.128.ip   v_delta, rp_rings, 16               # delta = rings[0:16]; rings += 16
+    ee.vsubs.s8     v_delta, v_delta, v_centers         # delta = delta - centers
+loop_end:
+    #undef v_b // q0
+    #undef v_curr_count // q3
+    #undef v_delta // q4
+    #undef v_prev_delta // q5
+
+    #undef r_neg_1 // a13
+    #undef r_0 // a14
+
+    #define r_8 a14
+    movi.n          r_8, 8
+
+    #define v_scores q0
+    ee.srcmb.s8.qacc    v_scores, r_8, 0
+    st.qr           v_scores, rp_scores, 0
+    #undef v_scores
+    #undef r_8
+
+    st.qr           v_max_count, rp_scores, 16
+
+    # #define r_11 todo
+    # movi            r_11, 11
+    # s32i.n          r_11, rp_stack_head, 0              # store 11 on stack
+    # #define v_11 todo
+    # ee.vldbc.8      v_11, rp_stack_head                 # 11 = [11, ] * 16
+    # #undef v_11
+
+
+
+    
+    # load n and 
+    
+simd_fast_compute_return:
+    # st.qr           pix_rings, out, 0
+    retw                        # restore state (windowed registers) and return to caller

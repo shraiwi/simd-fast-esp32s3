@@ -1,0 +1,148 @@
+    .section .rodata
+.l_mask:
+    .align 16
+    .byte 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0
+.l_h80:
+    .word 0x80
+.l_h10:
+    .word 0x10
+
+    .section .text
+    .align 4
+    .literal .lp_mask, .l_mask
+    .literal .lp_h80, .l_h80
+    .literal .lp_h10, .l_h10
+
+    .global simd_fast_compute3
+    .type   simd_fast_compute3,@function
+# compute the score and whether or not a pixel satisfies the FAST detector criteria
+# int32_t simd_fast_compute3(uint32_t center, const simdu8x16 pixels, uint32_t b, simd_u8x16 debug[8])
+simd_fast_compute3:
+    entry           sp, 48            # prepare windowed registers and reserve 16 bytes of stack
+
+    #define r_center a2
+    #define rp_pixels a3
+    #define r_b a4
+    #define rp_debug a5
+
+    #define rp_h80 a[3-11]
+    l32r            rp_h80, .lp_h80                 # p_h80 = .p_h80
+    #define v_h80 q[0-7]
+    ee.vldbc.8      v_h80, rp_h80                   # h80 = [ 0x80, ] * 16
+    #undef rp_h80
+
+    #define v_pixels q[0-7]
+    ld.qr           v_pixels, rp_pixels, 0          # pixels = pixels[0:16]
+    #undef rp_pixels
+    ee.xorq         v_pixels, v_pixels, v_h80       # pixels ^= [ 0x80, ] * 16 ; essentially "shifts down" the range from [0-255] (unsigned) to [-128, 127] (signed)
+
+    addi            r_center, r_center, -128        # r_center -= 128 
+    s8i             r_center, sp, 0
+    #undef r_center
+    #define v_center q[0-7]
+    ee.vldbc.8      v_center, sp                    # center = [ center - 128, ] * 16
+    
+    #define v_delta q[0-7]
+    ee.vsubs.s8     v_delta, v_pixels, v_center     # delta = pixels - center
+    #undef v_center
+    #undef v_pixels
+
+    # st.qr           v_delta, rp_debug, 0
+    
+    s8i             r_b, sp, 0                      # store b on the stack at 0
+    #define v_thresh q[0-7]
+    ee.vldbc.8      v_thresh, sp                    # thresh = [ b, ] * 16
+    ee.vcmp.gt.s8   v_thresh, v_delta, v_thresh     # thresh = -1 where delta > thresh else 0
+
+    # st.qr           v_thresh, rp_debug, 16
+
+    #define v_cmp q[0-7]
+    ee.zero.q       v_cmp                           # cmp = [ 0, ] * 16
+    ee.vsubs.s8     v_cmp, v_cmp, v_thresh          # cmp -= thresh
+
+    neg             r_b, r_b                        # b = -b
+    s8i             r_b, sp, 0                      # store -b on the stack at 0
+
+    ee.vldbc.8      v_thresh, sp                    # thresh = [ -b, ] * 16
+    ee.vcmp.lt.s8   v_thresh, v_delta, v_thresh     # thresh = 0xff where delta < thresh else 0
+
+    # st.qr           v_thresh, rp_debug, 32
+
+    #define rp_h10 a[3-11]
+    l32r            rp_h10, .lp_h10                 # p_h10 = p_h10
+    #define v_h10 q[0-7]
+    ee.vldbc.8      v_h10, rp_h10                   # h10 = [ 0x10, ] * 16
+    #undef rp_h10
+    ee.andq         v_thresh, v_thresh, v_h10       # thresh &= 0x10
+    #undef v_h10
+
+    ee.orq          v_cmp, v_cmp, v_thresh          # cmp |= thresh
+    #undef v_thresh
+
+    # st.qr           v_cmp, rp_debug, 48
+
+    # cmp = (0x01 where pixels > center + b else 0) | (0x10 where pixels < center - b else 0)
+    # v_cmp contains 0x10 for low extrema and/or 0x01 for high extrema.
+
+    #define rp_mask a[3-11]
+    l32r            rp_mask, .lp_mask
+    #define v_mask_l q[0-7]
+    ld.qr           v_mask_l, rp_mask, 0            # mask = [ 1, ] * 12 + [ 0, ] * 4
+    #undef rp_mask
+
+    #define r_0 a[3-11]
+    #define r_12 a[3-11]
+    #define r_16 a[3-11]
+    movi.n          r_0, 0
+    movi.n          r_12, 12
+    movi.n          r_16, 16
+
+    loopnez r_16, loop_end_nomatch
+loop_start:
+    ee.zero.accx                                    # ACCX = 0
+    ee.vmulas.s8.accx   v_cmp, v_mask_l             # ACCX += dot(cmp, mask_l)
+    #define r_pack_count a[3-11]
+    ee.srs.accx     r_pack_count, r_0, 0            # pack_count = ACCX >> 0
+
+    #define r_count a[3-11]
+    extui           r_count, r_pack_count, 4, 4     # count = (pack_count >> 4) & 0xf
+    bge             r_count, r_12, loop_end_match   # if count >= 12 goto loop_end_match
+    extui           r_count, r_pack_count, 0, 4     # count = (pack_count >> 0) & 0xf
+    bge             r_count, r_12, loop_end_match   # if count >= 12 goto loop_end_match
+    #undef r_count
+    #undef r_pack_count
+
+    #define v_mask_h q[0-7]
+    mv.qr           v_mask_h, v_mask_l              # mask_h = mask_l
+    ee.srci.2q      v_mask_h, v_mask_l, 0           # right rotate mask_l by 1 byte
+    #undef v_mask_h
+    # st.qr           v_mask_l, rp_debug, 64
+loop_end_nomatch:
+    #undef r_16
+    #undef r_12
+
+    #undef v_mask_l
+    #undef v_cmp
+    movi.n          a2, -1                          # retval = -1
+    j               return
+loop_end_match:
+    #define r_neg_1 a[3-11]
+    movi.n          r_neg_1, -1
+    ee.vrelu.s8     v_delta, r_neg_1, r_0           # delta = abs(delta)
+    #undef r_neg_1
+
+    #define r_1 a[3-11]
+    movi.n          r_1, 1
+    s8i             r_1, sp, 0
+    #undef r_1
+    #define v_1 q[0-7]
+    ee.vldbc.8      v_1, sp                         # 1 = [1, ] * 16
+    ee.zero.accx                                    # ACCX = 0
+    ee.vmulas.s8.accx   v_delta, v_1                # ACCX = dot(abs(delta), 1)
+    #undef v_1
+    #undef v_delta
+
+    ee.srs.accx     a2, r_0, 0               # retval = ACCX >> 0
+    #undef r_0
+return:
+    retw                        # restore state (windowed registers) and return to caller

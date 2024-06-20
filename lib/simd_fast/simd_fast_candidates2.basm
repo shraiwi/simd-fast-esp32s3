@@ -1,0 +1,104 @@
+    .section .rodata
+.l_h80:
+    .word 0x80
+
+    .section .text
+	.align 4
+    .literal .lp_h80, .l_h80
+
+    .global simd_fast_candidates2
+    .type   simd_fast_candidates2,@function
+# compute candidate pixels for the FAST detector
+# void simd_fast_candidates2(const simd_u8x16 * pixels, uint32_t width, uint32_t b, simd_u8x16 * count)
+simd_fast_candidates2:
+    entry           sp, 48            # prepare windowed registers and reserve 16 bytes of stack
+
+    #define rp_pixels a2
+    #define r_width a3
+    #define r_b a4
+    #define rp_out a5
+
+    #define rp_pixel_head a[3-11]
+    mov.n           rp_pixel_head, rp_pixels            # pixel_head = pixels
+    s8i             r_b, sp, 0                          # store r_b on the stack
+    #define v_b q[0-7]
+    ee.vldbc.8      v_b, sp                             # b = [ b, ] * 16
+    
+    #define r_stride a[3-11]
+    movi.n          r_stride, 3
+    mull            r_stride, r_stride, r_width         # stride = width * 3
+    #define v_center q[0-7]
+    ee.vld.128.xp   v_center, rp_pixel_head, r_stride   # center = pixel_head[0:16]; pixel_head += r_stride
+
+    #define rp_h80 a[3-11]
+    l32r            rp_h80, .lp_h80                     # p_h80 = .p_h80
+    #define v_h80 q[0-7]
+    ee.vldbc.8      v_h80, rp_h80                       # h80 = [ 0x80, ] * 16
+    #undef rp_h80
+
+    ee.xorq         v_center, v_center, v_h80           # center ^= 0x80 ; "shifts down" u8 data to i8, [0 255] => [-128 127]
+
+    movi.n          r_stride, -6
+    mull            r_stride, r_stride, r_width         # stride = width * -6
+
+    # compute cardinal -y pixels
+    #define v_thresh q[0-7]
+    ee.vld.128.xp   v_thresh, rp_pixel_head, r_stride   # thresh = pixel_head[0:16]; pixel_head += r_stride
+    ee.xorq         v_thresh, v_thresh, v_h80           # thresh ^= 0x80
+    #undef r_stride
+    ee.vsubs.s8     v_thresh, v_thresh, v_center        # thresh -= center
+    #define r_neg_1 a[3-11]
+    #define r_0 a[3-11]
+    movi.n          r_neg_1, -1                         # neg_1 = -1
+    movi.n          r_0, 0                              # 0 = 0
+    ee.vrelu.s8     v_thresh, r_neg_1, r_0              # thresh = abs(thresh)
+    ee.vcmp.gt.s8   v_thresh, v_thresh, v_b             # thresh = -1 if thresh > b else 0
+    #define v_count q[0-7]
+    ee.zero.q       v_count
+    ee.vsubs.s8     v_count, v_count, v_thresh          # count -= thresh
+
+    # compute cardinal +y pixels
+    ld.qr           v_thresh, rp_pixel_head, 0          # thresh = pixel_head[0:16];
+    ee.xorq         v_thresh, v_thresh, v_h80           # thresh ^= 0x80
+    #undef rp_pixel_head
+    ee.vsubs.s8     v_thresh, v_thresh, v_center        # thresh -= center
+    ee.vrelu.s8     v_thresh, r_neg_1, r_0              # thresh = abs(thresh)
+    ee.vcmp.gt.s8   v_thresh, v_thresh, v_b             # thresh = -1 if thresh > b else 0
+    ee.vsubs.s8     v_count, v_count, v_thresh          # count -= thresh
+
+    # compute cardinal -x pixels
+    ld.qr           v_thresh, rp_pixels, -16            # thresh = (pixels - 16)[0:16]
+    ee.xorq         v_thresh, v_thresh, v_h80           # thresh ^= 0x80
+    #define r_13 a[3-11]
+    movi.n          r_13, 13
+    wur.sar_byte    r_13                                # SAR_BYTE = 13
+    #undef r_13
+    ee.src.q        v_thresh, v_thresh, v_center        # thresh = [*thresh, *center][13:13+16]
+    ee.vsubs.s8     v_thresh, v_thresh, v_center        # thresh -= center
+    ee.vrelu.s8     v_thresh, r_neg_1, r_0              # thresh = abs(thresh)
+    ee.vcmp.gt.s8   v_thresh, v_thresh, v_b             # thresh = -1 if thresh > b else 0
+    ee.vsubs.s8     v_count, v_count, v_thresh          # count -= thresh
+
+    # compute cardinal +x pixels
+    ld.qr           v_thresh, rp_pixels, 16             # thresh = (pixels + 16)[0:16]
+    ee.xorq         v_thresh, v_thresh, v_h80           # thresh ^= 0x80
+    #define r_3 a[3-11]
+    movi.n          r_3, 3
+    wur.sar_byte    r_3                                 # SAR_BYTE = 3
+    #undef r_3
+    ee.src.q        v_thresh, v_center, v_thresh        # thresh = [*center, *thresh][3:3+16]
+    ee.vsubs.s8     v_thresh, v_thresh, v_center        # thresh -= center
+    #undef v_center
+    ee.vrelu.s8     v_thresh, r_neg_1, r_0              # thresh = abs(thresh)
+    #undef r_0
+    #undef r_neg_1
+    ee.vcmp.gt.s8   v_thresh, v_thresh, v_b             # thresh = -1 if thresh > b else 0
+    ee.vsubs.s8     v_count, v_count, v_thresh          # count -= thresh
+
+    #undef v_thresh
+    #undef v_b
+
+    st.qr           v_count, rp_out, 0
+    # mov.n           a2, rp_pixel_head
+    #undef v_count
+    retw.n                                              # restore state (windowed registers) and return to caller

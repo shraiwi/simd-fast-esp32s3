@@ -1,0 +1,112 @@
+
+    .section .literal
+.magic:
+    .word 0x01010101
+
+    .section .text
+    .global simd_fast_candidates
+    .type   simd_fast_candidates,@function
+# compute candidate pixels for the FAST detector.
+# void simd_fast_candidates(const simd_u8x16 * pixels, uint32_t width, uint32_t b, simd_u8x16 * out)
+simd_fast_candidates:
+    entry           a1,16            # prepare windowed registers and reserve 16 bytes of stack
+
+    #define pixels a2
+    #define width a3
+    #define b a4
+    #define out a5
+
+    #define head a15
+    mov             head, pixels            # head = pixels
+
+    # stride = width * 3 / 16 - 3
+    #define stride a14
+    movi            stride, 3               # stride = 3
+    mull            stride, stride, width   # stride *= width
+    # srli            stride, stride, 4       # stride >>= 4
+    addi            stride, stride, -3      # stride -= 3
+
+    # stride moves 3 rows down, 3 cols left
+
+    #define pix_py q0
+    #define pix_ny q1
+    #define pix_px q2
+    #define pix_nx q3
+    #define pix_c q4
+
+    # the head moves in this order: py, nx, px, c, ny.
+
+    ee.vld.128.xp   pix_py, head, stride    # pix_py = pixels[head:head+16], head += stride
+    ee.ld.128.usar.ip   pix_nx, head, 32    # pix_nx = pixels[head:head+16], head += 32, SAR_BYTE = 13
+    ee.vld.128.ip   pix_px, head, -16       # pix_px = pixels[head:head+16], head -= 16
+    ee.vld.128.xp   pix_c, head, stride     # pix_c  = pixels[head:head+16], head += stride
+    ee.vld.128.ip   pix_ny, head, 0         # pix_px = pixels[head:head+16], head += 0
+    #undef stride
+    #undef head
+
+    ee.src.q        pix_nx, pix_nx, pix_c   # pix_nx = [*pix_nx, *pix_c][SAR_BYTE:SAR_BYTE+16]
+
+    #define const_three a15
+    movi            const_three, 3
+    wur.sar_byte    const_three             # SAR_BYTE = 3
+    ee.src.q        pix_px, pix_c, pix_px   # pix_px = [*pix_c, *pix_px][SAR_BYTE:SAR_BYTE+16]
+    
+
+    # all cardinals are loaded. time to preform fast initial test.
+
+    #define b_32 a15
+    l32r            b_32, .magic        # b_32 = 0x01010101
+    mull            b_32, b_32, b       # b_32 *= b
+
+    #define b_128 q5
+    ee.movi.32.q    b_128, b_32, 0         # b_128[0:4] = b ; 1 byte is b
+    ee.movi.32.q    b_128, b_32, 1
+    ee.movi.32.q    b_128, b_32, 2
+    ee.movi.32.q    b_128, b_32, 3
+
+    #define const_neg1 a14
+    #define const_zero a13
+    movi            const_neg1, -1
+    movi.n          const_zero, 0
+
+    # high test
+    #define delta q6
+    #define result q7
+
+    # todo: make this more efficient by integrating loads with math. use ee.vsubs.s8.ld.incp
+
+    ee.zero.q       result                          # result = [0, ] * 16
+
+    ee.vsubs.s8     delta, pix_px, pix_c            # delta = pix_px - pix_c
+    ee.vrelu.s8     delta, const_neg1, const_zero   # delta = (delta * -1) >> 0 where delta <= 0 else delta
+    ee.vcmp.gt.s8   delta, delta, b_128             # delta = -1 where delta > b else 0
+    ee.vsubs.s8     result, result, delta           # result -= delta
+
+    ee.vsubs.s8     delta, pix_nx, pix_c            # delta = pix_nx - pix_c
+    ee.vrelu.s8     delta, const_neg1, const_zero   # delta = (delta * -1) >> 0 where delta <= 0 else delta
+    ee.vcmp.gt.s8   delta, delta, b_128             # delta = -1 where delta > b else 0
+    ee.vsubs.s8     result, result, delta           # result -= delta
+
+    ee.vsubs.s8     delta, pix_py, pix_c            # delta = pix_py - pix_c
+    ee.vrelu.s8     delta, const_neg1, const_zero   # delta = (delta * -1) >> 0 where delta <= 0 else delta
+    ee.vcmp.gt.s8   delta, delta, b_128             # delta = -1 where delta > b else 0
+    ee.vsubs.s8     result, result, delta           # result -= delta
+
+    ee.vsubs.s8     delta, pix_ny, pix_c            # delta = pix_ny - pix_c
+    ee.vrelu.s8     delta, const_neg1, const_zero   # delta = (delta * -1) >> 0 where delta <= 0 else delta
+    ee.vcmp.gt.s8   delta, delta, b_128             # delta = -1 where delta > b else 0
+    ee.vsubs.s8     result, result, delta           # result -= delta
+
+    #undef delta
+
+    #undef const_zero
+    #undef const_neg1
+
+    st.qr           result, out, 0
+    # st.qr           pix_c, out, 16
+    # st.qr           pix_nx, out, 32
+    # st.qr           pix_px, out, 48
+    # st.qr           pix_ny, out, 64
+    # st.qr           pix_py, out, 80
+    # mov	            a2, b_32            # return value of b_32
+    retw                                # restore state (windowed registers) and return to caller
