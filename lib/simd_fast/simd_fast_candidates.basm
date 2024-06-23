@@ -1,112 +1,111 @@
-
-    .section .literal
-.magic:
-    .word 0x01010101
+    .section .rodata
+.l_h80:
+    .word 0x80
 
     .section .text
+	.align 4
+    .literal .lp_h80, .l_h80
+
     .global simd_fast_candidates
     .type   simd_fast_candidates,@function
-# compute candidate pixels for the FAST detector.
-# void simd_fast_candidates(const simd_u8x16 * pixels, uint32_t width, uint32_t b, simd_u8x16 * out)
+# compute candidate pixels for the FAST detector
+# void simd_fast_candidates(const simd_u8x16 * pixels, int32_t rowstride, uint32_t b, simd_u8x16 * count)
 simd_fast_candidates:
-    entry           a1,16            # prepare windowed registers and reserve 16 bytes of stack
+    entry           sp, 48            # prepare windowed registers and reserve 16 bytes of stack
 
-    #define pixels a2
-    #define width a3
-    #define b a4
-    #define out a5
+    #define rp_pixels a2
+    #define r_rowstride a3
+    #define r_b a4
+    #define rp_out a5
 
-    #define head a15
-    mov             head, pixels            # head = pixels
-
-    # stride = width * 3 / 16 - 3
-    #define stride a14
-    movi            stride, 3               # stride = 3
-    mull            stride, stride, width   # stride *= width
-    # srli            stride, stride, 4       # stride >>= 4
-    addi            stride, stride, -3      # stride -= 3
-
-    # stride moves 3 rows down, 3 cols left
-
-    #define pix_py q0
-    #define pix_ny q1
-    #define pix_px q2
-    #define pix_nx q3
-    #define pix_c q4
-
-    # the head moves in this order: py, nx, px, c, ny.
-
-    ee.vld.128.xp   pix_py, head, stride    # pix_py = pixels[head:head+16], head += stride
-    ee.ld.128.usar.ip   pix_nx, head, 32    # pix_nx = pixels[head:head+16], head += 32, SAR_BYTE = 13
-    ee.vld.128.ip   pix_px, head, -16       # pix_px = pixels[head:head+16], head -= 16
-    ee.vld.128.xp   pix_c, head, stride     # pix_c  = pixels[head:head+16], head += stride
-    ee.vld.128.ip   pix_ny, head, 0         # pix_px = pixels[head:head+16], head += 0
-    #undef stride
-    #undef head
-
-    ee.src.q        pix_nx, pix_nx, pix_c   # pix_nx = [*pix_nx, *pix_c][SAR_BYTE:SAR_BYTE+16]
-
-    #define const_three a15
-    movi            const_three, 3
-    wur.sar_byte    const_three             # SAR_BYTE = 3
-    ee.src.q        pix_px, pix_c, pix_px   # pix_px = [*pix_c, *pix_px][SAR_BYTE:SAR_BYTE+16]
+    #define rp_pixel_head a[3-11]
+    mov.n           rp_pixel_head, rp_pixels            # pixel_head = pixels
+    s8i             r_b, sp, 0                          # store r_b on the stack
+    #define v_b q[0-7]
+    ee.vldbc.8      v_b, sp                             # b = [ b, ] * 16
     
+    #define r_stride a[3-11]
+    movi.n          r_stride, 3
+    mull            r_stride, r_stride, r_rowstride     # stride = rowstride * 3
+    
+    #define v_center q[0-7]
+    ee.vld.128.xp   v_center, rp_pixel_head, r_stride   # center = pixel_head[0:16]; pixel_head += r_stride
 
-    # all cardinals are loaded. time to preform fast initial test.
+    #define rp_h80 a[3-11]
+    l32r            rp_h80, .lp_h80                     # p_h80 = .p_h80
+    #define v_h80 q[0-7]
+    ee.vldbc.8      v_h80, rp_h80                       # h80 = [ 0x80, ] * 16
+    #undef rp_h80
 
-    #define b_32 a15
-    l32r            b_32, .magic        # b_32 = 0x01010101
-    mull            b_32, b_32, b       # b_32 *= b
+    ee.xorq         v_center, v_center, v_h80           # center ^= 0x80 ; "shifts down" u8 data to i8, [0 255] => [-128 127]
 
-    #define b_128 q5
-    ee.movi.32.q    b_128, b_32, 0         # b_128[0:4] = b ; 1 byte is b
-    ee.movi.32.q    b_128, b_32, 1
-    ee.movi.32.q    b_128, b_32, 2
-    ee.movi.32.q    b_128, b_32, 3
+    #define v_thi q[0-7]
+    ee.vadds.s8     v_thi, v_center, v_b                # thi = center + b
+    #define v_tlo q[0-7]
+    ee.vsubs.s8     v_tlo, v_center, v_b                # tlo = center - b
+    #undef v_b
 
-    #define const_neg1 a14
-    #define const_zero a13
-    movi            const_neg1, -1
-    movi.n          const_zero, 0
+    movi.n          r_stride, -6
+    mull            r_stride, r_stride, r_rowstride     # stride = rowstride * -6
 
-    # high test
-    #define delta q6
-    #define result q7
+    # compute cardinal -y pixels
+    #define v_pixels q[0-7]
+    ee.vld.128.xp   v_pixels, rp_pixel_head, r_stride   # pixels = pixel_head[0:16]; pixel_head += r_stride
+    ee.xorq         v_pixels, v_pixels, v_h80           # pixels ^= 0x80
+    #undef r_stride
+    #define v_incr q[0-7]
+    #define v_count q[0-7]
+    ee.zero.q       v_count
 
-    # todo: make this more efficient by integrating loads with math. use ee.vsubs.s8.ld.incp
+    ee.vcmp.gt.s8   v_incr, v_pixels, v_thi             # incr = -1 if pixels > thi else 0
+    ee.vsubs.s8     v_count, v_count, v_incr            # count -= pixels
+    ee.vcmp.lt.s8   v_incr, v_pixels, v_tlo             # incr = -1 if pixels < tlo else 0
+    ee.vsubs.s8     v_count, v_count, v_incr            # count -= pixels
 
-    ee.zero.q       result                          # result = [0, ] * 16
 
-    ee.vsubs.s8     delta, pix_px, pix_c            # delta = pix_px - pix_c
-    ee.vrelu.s8     delta, const_neg1, const_zero   # delta = (delta * -1) >> 0 where delta <= 0 else delta
-    ee.vcmp.gt.s8   delta, delta, b_128             # delta = -1 where delta > b else 0
-    ee.vsubs.s8     result, result, delta           # result -= delta
+    # compute cardinal +y pixels
+    ld.qr           v_pixels, rp_pixel_head, 0          # pixels = pixel_head[0:16];
+    ee.xorq         v_pixels, v_pixels, v_h80           # pixels ^= 0x80
+    #undef rp_pixel_head
+    ee.vcmp.gt.s8   v_incr, v_pixels, v_thi             # incr = -1 if pixels > thi else 0
+    ee.vsubs.s8     v_count, v_count, v_incr            # count -= pixels
+    ee.vcmp.lt.s8   v_incr, v_pixels, v_tlo             # incr = -1 if pixels < tlo else 0
+    ee.vsubs.s8     v_count, v_count, v_incr            # count -= pixels
 
-    ee.vsubs.s8     delta, pix_nx, pix_c            # delta = pix_nx - pix_c
-    ee.vrelu.s8     delta, const_neg1, const_zero   # delta = (delta * -1) >> 0 where delta <= 0 else delta
-    ee.vcmp.gt.s8   delta, delta, b_128             # delta = -1 where delta > b else 0
-    ee.vsubs.s8     result, result, delta           # result -= delta
+    # compute cardinal -x pixels
+    ld.qr           v_pixels, rp_pixels, -16            # pixels = (pixels - 16)[0:16]
+    ee.xorq         v_pixels, v_pixels, v_h80           # pixels ^= 0x80
+    #define r_13 a[3-11]
+    movi.n          r_13, 13
+    wur.sar_byte    r_13                                # SAR_BYTE = 13
+    #undef r_13
+    ee.src.q        v_pixels, v_pixels, v_center        # thresh = [*thresh, *center][13:13+16]
+    
+    ee.vcmp.gt.s8   v_incr, v_pixels, v_thi             # incr = -1 if pixels > thi else 0
+    ee.vsubs.s8     v_count, v_count, v_incr            # count -= pixels
+    ee.vcmp.lt.s8   v_incr, v_pixels, v_tlo             # incr = -1 if pixels < tlo else 0
+    ee.vsubs.s8     v_count, v_count, v_incr            # count -= pixels
 
-    ee.vsubs.s8     delta, pix_py, pix_c            # delta = pix_py - pix_c
-    ee.vrelu.s8     delta, const_neg1, const_zero   # delta = (delta * -1) >> 0 where delta <= 0 else delta
-    ee.vcmp.gt.s8   delta, delta, b_128             # delta = -1 where delta > b else 0
-    ee.vsubs.s8     result, result, delta           # result -= delta
+    # compute cardinal +x pixels
+    ld.qr           v_pixels, rp_pixels, 16             # thresh = (pixels + 16)[0:16]
+    ee.xorq         v_pixels, v_pixels, v_h80           # thresh ^= 0x80
+    #define r_3 a[3-11]
+    movi.n          r_3, 3
+    wur.sar_byte    r_3                                 # SAR_BYTE = 3
+    #undef r_3
+    ee.src.q        v_pixels, v_center, v_pixels        # thresh = [*center, *thresh][3:3+16]
+    
+    ee.vcmp.gt.s8   v_incr, v_pixels, v_thi             # incr = -1 if pixels > thi else 0
+    ee.vsubs.s8     v_count, v_count, v_incr            # count -= pixels
+    ee.vcmp.lt.s8   v_incr, v_pixels, v_tlo             # incr = -1 if pixels < tlo else 0
+    ee.vsubs.s8     v_count, v_count, v_incr            # count -= pixels
 
-    ee.vsubs.s8     delta, pix_ny, pix_c            # delta = pix_ny - pix_c
-    ee.vrelu.s8     delta, const_neg1, const_zero   # delta = (delta * -1) >> 0 where delta <= 0 else delta
-    ee.vcmp.gt.s8   delta, delta, b_128             # delta = -1 where delta > b else 0
-    ee.vsubs.s8     result, result, delta           # result -= delta
+    #undef v_incr
+    #undef v_pixels
+    #undef v_tlo
+    #undef v_thi
 
-    #undef delta
-
-    #undef const_zero
-    #undef const_neg1
-
-    st.qr           result, out, 0
-    # st.qr           pix_c, out, 16
-    # st.qr           pix_nx, out, 32
-    # st.qr           pix_px, out, 48
-    # st.qr           pix_ny, out, 64
-    # st.qr           pix_py, out, 80
-    # mov	            a2, b_32            # return value of b_32
-    retw                                # restore state (windowed registers) and return to caller
+    st.qr           v_count, rp_out, 0
+    # mov.n           a2, rp_pixel_head
+    #undef v_count
+    retw.n                                              # restore state (windowed registers) and return to caller

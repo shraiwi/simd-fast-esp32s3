@@ -5,7 +5,17 @@ from itertools import chain
 import re
 from pathlib import Path
 
+class BasmException(Exception):
+    def __init__(self, line: int, *args: object) -> None:
+        super().__init__(*args)
+        self.line = line
+
+class OutOfRegisters(BasmException): pass
+class UnknownSymbol(BasmException): pass
+
 def extract_regs(data, path = None):
+    global current_line
+
     RE_DEFS = r'#(define|undef)[ \t]+([a-z_][a-z0-9_]*)(?:[ \t]+([a-z])(\[(\d+)-(\d+)\]|(\d+)))?'
 
     line_starts = [m.start() for m in re.finditer('\n', data)]
@@ -16,6 +26,9 @@ def extract_regs(data, path = None):
     owners: dict[str, tuple[str, int]] = {}
 
     def sub_register(match: re.Match) -> str:
+        start = match.start()
+        line = next(line for line, line_start in enumerate(line_starts) if line_start > start) + 1
+
         directive, sym, reg, constraint, lo, hi, val = match.groups()
 
         match directive.lower():
@@ -36,11 +49,7 @@ def extract_regs(data, path = None):
                 # take the lowest available register
                 took: int = min(options - taken_set, default=None)
                 
-                if took is None: 
-                    start = match.start()
-                    line = next(line for line, line_start in enumerate(line_starts) if line_start > start) + 1
-                    print(f"[basm] no available registers for {sym} in {str(path)}:{line}")
-                    raise Exception()
+                if took is None: raise OutOfRegisters(line)
                 owners[sym] = (reg, took)
                 taken_set.add(took)
 
@@ -51,6 +60,7 @@ def extract_regs(data, path = None):
 
                 return f"{prefix}{took}{suffix} // basm: take {reg}{took}" 
             case 'undef':
+                if sym not in owners: raise UnknownSymbol(line)
                 reg, took = owners.pop(sym)
                 taken[reg].remove(took)
                 return f"{match.group()} // basm: free {reg}{took}"
@@ -64,12 +74,17 @@ def extract_regs(data, path = None):
 
 
 def process(path: Path):
-    print(path.with_suffix(".S"))
-    path.with_suffix(".S").write_text(
-        extract_regs(path.read_text(), path))
+    print(f"[basm] processing {path.with_suffix('.S')}")
 
-# def basm_rebuild(source, target, env):
-print("basm: processing...", Path.cwd())
+    try:
+        path.with_suffix(".S").write_text(
+            extract_regs(path.read_text(), path))
+    except OutOfRegisters as e:
+        print(f"\terror: ran out of registers {str(path)}:{e.line}")
+        exit(-1)
+    except UnknownSymbol as e: 
+        print(f"\terror: encountered unknown symbol {str(path)}:{e.line}")
+        exit(-1)
 
 paths = (
     *env["LIBSOURCE_DIRS"],
@@ -79,8 +94,4 @@ paths = (
 cwd = Path.cwd()
 for path in chain(*(Path(p).glob("**/*.basm") for p in paths)):
     process(path)
-    
-
-#for arg in sys.argv[1:]:
-#    process(Path(arg))
     
